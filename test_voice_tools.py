@@ -629,6 +629,183 @@ async def run_voice_tool_tests():
     await task_tst.cancel()
     print("  ✓ Per-context audio tracking: normal+no-audio paths, redaction, timeout extension verified")
 
+    # 13. ElevenLabs TTS WebSocket Response Diagnostics & Error Handling
+    print("\n[TEST 13] ElevenLabs TTS WebSocket Response Diagnostics & Error Handling")
+    import base64
+    import json
+    from pipecat.frames.frames import ErrorFrame
+
+    class _FakeWS:
+        def __init__(self, payloads: list[dict]):
+            self._messages = [json.dumps(p) for p in payloads]
+
+        def __aiter__(self):
+            return self._iter()
+
+        async def _iter(self):
+            for raw in self._messages:
+                yield raw
+
+    async def _drive_ws_messages(tts_obj, context_id: str, payloads: list[dict]):
+        """Drive tts._receive_messages() with mocked WS payloads and collect appended items + pushed errors."""
+        appended: list[tuple[str | None, object]] = []
+        errors: list[ErrorFrame] = []
+
+        orig_append = tts_obj.append_to_audio_context
+        orig_push_error_frame = tts_obj.push_error_frame
+
+        async def _spy_append(ctx_id, frame):
+            appended.append((ctx_id, frame))
+            return await orig_append(ctx_id, frame)
+
+        async def _spy_push_error_frame(error: ErrorFrame, force_treat_as_permanent: bool = False):
+            errors.append(error)
+            return await orig_push_error_frame(error, force_treat_as_permanent=force_treat_as_permanent)
+
+        tts_obj.append_to_audio_context = _spy_append
+        tts_obj.push_error_frame = _spy_push_error_frame
+        tts_obj._get_websocket = lambda: _FakeWS(payloads)
+        try:
+            await tts_obj.create_audio_context(context_id)
+            await tts_obj._receive_messages()
+        finally:
+            tts_obj.append_to_audio_context = orig_append
+            tts_obj.push_error_frame = orig_push_error_frame
+        return appended, errors
+
+    conn_ws = SmallWebRTCConnection()
+    task_ws, transport_ws, _, _ = build_voice_pipeline(conn_ws, dummy_cfg)
+    ws_procs = list(_iter_processors(task_ws.pipeline))
+    groq_ws = next(p for p in ws_procs if isinstance(p, GroqLLMService))
+    tts_ws = next(p for p in ws_procs if isinstance(p, _ElevenLabsTTSService))
+
+    # Re-attach explicitly to capture returned stats handle cleanly while also verifying production hook.
+    stats13 = attach_speech_timing_logs(groq_ws, tts_ws, transport_ws)
+    assert tts_ws._stop_frame_timeout_s == 12.0
+
+    t13_logs: list[str] = []
+    sink13 = loguru_logger.add(lambda m: t13_logs.append(str(m)), level="DEBUG")
+    try:
+        sample_pcm = b"\x01\x02" * 240
+        sample_b64 = base64.b64encode(sample_pcm).decode("ascii")
+
+        # Case A: Normal audio response followed by final message (with null audio) + audio inside final frame.
+        ctx_norm = "11111111-aaaa-bbbb-cccc-000000000001"
+        appended_a, errors_a = await _drive_ws_messages(
+            tts_ws,
+            ctx_norm,
+            [
+                {
+                    "audio": sample_b64,
+                    "contextId": ctx_norm,
+                    "isFinal": False,
+                    "alignment": {
+                        "chars": ["H", "i", " "],
+                        "charStartTimesMs": [0, 50, 100],
+                        "charDurationsMs": [50, 50, 50],
+                    },
+                },
+                {"audio": None, "contextId": ctx_norm, "isFinal": True},
+            ],
+        )
+        assert any(isinstance(f, TTSAudioRawFrame) and f.audio == sample_pcm for _, f in appended_a)
+        assert any(isinstance(f, TTSStoppedFrame) for _, f in appended_a)
+        assert errors_a == []
+        joined_a = "\n".join(t13_logs)
+        assert "ElevenLabs final response contained no audio" not in joined_a
+        assert "has_audio_field=True" in joined_a and "audio_null=True" in joined_a
+        assert sample_b64 not in joined_a
+
+        # Case A2: Audio carried inside the isFinal=True message is preserved (not dropped).
+        t13_logs.clear()
+        ctx_inline = "11111111-aaaa-bbbb-cccc-000000000002"
+        appended_a2, errors_a2 = await _drive_ws_messages(
+            tts_ws,
+            ctx_inline,
+            [{"audio": sample_b64, "contextId": ctx_inline, "isFinal": True}],
+        )
+        assert any(isinstance(f, TTSAudioRawFrame) and f.audio == sample_pcm for _, f in appended_a2)
+        assert any(isinstance(f, TTSStoppedFrame) for _, f in appended_a2)
+        assert errors_a2 == []
+        assert "ElevenLabs final response contained no audio" not in "\n".join(t13_logs)
+
+        # Case B: Final response with null audio (no prior audio, no provider error).
+        t13_logs.clear()
+        ctx_null = "22222222-aaaa-bbbb-cccc-000000000003"
+        appended_b, errors_b = await _drive_ws_messages(
+            tts_ws,
+            ctx_null,
+            [{"audio": None, "contextId": ctx_null, "isFinal": True}],
+        )
+        assert not any(isinstance(f, TTSAudioRawFrame) for _, f in appended_b)
+        assert errors_b == []
+        joined_b = "\n".join(t13_logs)
+        assert "ElevenLabs final response contained no audio and no provider error" in joined_b
+        assert "isFinal=True" in joined_b
+        assert "has_audio_field=True" in joined_b
+        assert "audio_null=True" in joined_b
+        assert "audio_empty=False" in joined_b
+        assert "alignment_present=False" in joined_b
+        assert "has_error_field=False" in joined_b
+
+        # Case C: Final response with empty string audio ("").
+        t13_logs.clear()
+        ctx_empty = "33333333-aaaa-bbbb-cccc-000000000004"
+        appended_c, errors_c = await _drive_ws_messages(
+            tts_ws,
+            ctx_empty,
+            [{"audio": "", "contextId": ctx_empty, "isFinal": True}],
+        )
+        assert not any(isinstance(f, TTSAudioRawFrame) for _, f in appended_c)
+        assert errors_c == []
+        joined_c = "\n".join(t13_logs)
+        assert "ElevenLabs final response contained no audio and no provider error" in joined_c
+        assert "audio_null=False" in joined_c
+        assert "audio_empty=True" in joined_c
+
+        # Case D & E: Provider error response + privacy redaction of keys/auth/phones/payloads.
+        t13_logs.clear()
+        ctx_err = "44444444-aaaa-bbbb-cccc-000000000005"
+        secret_like = "sk_live_secret_token_9876543210"
+        auth_hdr = "Authorization: Bearer tok_abc123def456"
+        patient_phone = "+1-555-867-5309"
+        appended_d, errors_d = await _drive_ws_messages(
+            tts_ws,
+            ctx_err,
+            [
+                {
+                    "error": "voice_not_found",
+                    "code": 404,
+                    "message": f"Voice missing; xi-api-key={secret_like} {auth_hdr} caller {patient_phone}",
+                    "contextId": ctx_err,
+                    "isFinal": True,
+                }
+            ],
+        )
+        assert not any(isinstance(f, TTSAudioRawFrame) for _, f in appended_d)
+        assert len(errors_d) == 1
+        assert "404" in errors_d[0].error
+        assert "voice_not_found" in errors_d[0].error
+        assert secret_like not in errors_d[0].error
+        assert "tok_abc123def456" not in errors_d[0].error
+        assert "555-867-5309" not in errors_d[0].error
+
+        joined_d = "\n".join(t13_logs)
+        assert "ElevenLabs final response contained no audio and no provider error" not in joined_d
+        assert "ElevenLabs WS provider error" in joined_d
+        assert "error_code=404" in joined_d
+        assert "voice_not_found" in joined_d
+        assert secret_like not in joined_d
+        assert "tok_abc123def456" not in joined_d
+        assert "555-867-5309" not in joined_d
+        assert stats13.tts_provider_errors == 1
+        assert stats13.tts_final_messages >= 4
+    finally:
+        loguru_logger.remove(sink13)
+
+    await task_ws.cancel()
+    print("  ✓ ElevenLabs WS final/null/empty/error handling, inline audio, and privacy redaction verified")
+
     # Verify FastAPI lifespan creates & closes shared aiohttp session and /voice/offer rejects when unconfigured
     from app.api.v1.endpoints import voice as voice_endpoint
 
