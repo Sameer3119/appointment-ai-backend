@@ -1,0 +1,507 @@
+"""Isolated test suite for app/services/voice_tool_service.py.
+
+Uses an in-memory SQLite database so development appointments.db is untouched.
+"""
+
+import asyncio
+from datetime import datetime, timedelta
+import os
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from fastapi.testclient import TestClient
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.services.groq.llm import GroqLLMService
+from pipecat.services.llm_service import FunctionCallParams
+from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+
+from app.config import Settings
+from app.database import Base
+from app.main import app as fastapi_app
+from app.models.appointment import Appointment
+from app.models.doctor import Doctor
+from app.models.patient import Patient
+from app.seed import seed_doctors
+from app.services.voice_tool_service import (
+    VoiceCallState,
+    book_appointment,
+    cancel_appointment,
+    check_doctor_availability,
+    normalize_phone,
+)
+from app.voice.phone_confirmation import PhoneConfirmationTracker
+from app.voice.pipeline import (
+    VoiceConfigurationError,
+    build_voice_pipeline,
+    validate_voice_config,
+)
+from app.voice.tools import register_appointment_tools
+
+
+TEST_DATABASE_URL = "sqlite:///:memory:"
+test_engine = create_engine(
+    TEST_DATABASE_URL,
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+
+
+class TrackingSessionFactory:
+    """Wraps a sessionmaker to verify every created session is closed."""
+
+    def __init__(self, inner_factory):
+        self._inner_factory = inner_factory
+        self.created_count = 0
+        self.closed_count = 0
+
+    def __call__(self):
+        session = self._inner_factory()
+        self.created_count += 1
+        original_close = session.close
+
+        def tracked_close():
+            self.closed_count += 1
+            return original_close()
+
+        session.close = tracked_close
+        return session
+
+
+async def run_voice_tool_tests():
+    print("=" * 70)
+    print("MEDIVOICE AI VOICE TOOL SERVICE TEST SUITE (IN-MEMORY DB)")
+    print("=" * 70)
+
+    dev_db_path = "appointments.db"
+    dev_db_initial_stat = None
+    if os.path.exists(dev_db_path):
+        dev_db_initial_stat = (os.path.getmtime(dev_db_path), os.path.getsize(dev_db_path))
+
+    Base.metadata.drop_all(bind=test_engine)
+    Base.metadata.create_all(bind=test_engine)
+
+    with TestingSessionLocal() as db:
+        seed_doctors(db)
+        first_doc = db.query(Doctor).filter(Doctor.is_available == True).first()  # noqa: E712
+        active_doctor_id = first_doc.id
+        # Pre-seed a patient with formatted phone to verify preservation
+        formatted_patient = Patient(name="Alice Formatted", phone="+1-555-111-2222")
+        db.add(formatted_patient)
+        db.commit()
+        db.refresh(formatted_patient)
+        formatted_patient_id = formatted_patient.id
+
+    session_tracker = TrackingSessionFactory(TestingSessionLocal)
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # 1. Phone normalization tests
+    print("\n[TEST 1] Phone Normalization")
+    assert normalize_phone(" +1 (555) 111-2222 ") == "+15551112222"
+    assert normalize_phone("555-111-2222") == "5551112222"
+    assert normalize_phone("+15551112222") != normalize_phone("5551112222")
+    assert normalize_phone("+15551112222") != normalize_phone("+445551112222")
+    print("  ✓ Formatting stripped, leading '+' preserved, country codes kept distinct")
+
+    # 2. Availability lookup
+    print("\n[TEST 2] Availability Lookup")
+    avail_by_id = await check_doctor_availability(
+        date=tomorrow,
+        doctor_id=active_doctor_id,
+        session_factory=session_tracker,
+    )
+    assert avail_by_id["success"] is True, avail_by_id
+    assert len(avail_by_id["doctors"]) == 1
+    assert "10:00" in avail_by_id["doctors"][0]["available_slots"]
+
+    avail_by_spec = await check_doctor_availability(
+        date=tomorrow,
+        specialty="Cardiology",
+        session_factory=session_tracker,
+    )
+    assert avail_by_spec["success"] is True, avail_by_spec
+    assert len(avail_by_spec["doctors"]) >= 1
+    print("  ✓ check_doctor_availability works by doctor_id and specialty")
+
+    # 3. Booking without confirmed phone is rejected
+    print("\n[TEST 3] Reject Booking Without Confirmed Phone")
+    unconfirmed_state = VoiceCallState()
+    res_no_phone = await book_appointment(
+        call_state=unconfirmed_state,
+        doctor_id=active_doctor_id,
+        appointment_datetime=f"{tomorrow}T10:00:00",
+        patient_name="Bob Unconfirmed",
+        session_factory=session_tracker,
+    )
+    assert res_no_phone["success"] is False
+    assert "confirmed" in res_no_phone["error"].lower()
+
+    unconfirmed_state.set_pending_phone("+1-555-333-4444")
+    res_pending_only = await book_appointment(
+        call_state=unconfirmed_state,
+        doctor_id=active_doctor_id,
+        appointment_datetime=f"{tomorrow}T10:00:00",
+        patient_name="Bob Unconfirmed",
+        session_factory=session_tracker,
+    )
+    assert res_pending_only["success"] is False
+    assert "confirmed" in res_pending_only["error"].lower()
+    print("  ✓ Booking rejected when phone is missing or only pending")
+
+    # 4. Booking with confirmed phone succeeds & preserves existing formatted phone
+    print("\n[TEST 4] Booking With Confirmed Phone")
+    alice_state = VoiceCallState()
+    alice_state.set_pending_phone("+1 (555) 111-2222")
+    alice_state.confirm_pending_phone()
+
+    res_book = await book_appointment(
+        call_state=alice_state,
+        doctor_id=active_doctor_id,
+        appointment_datetime=f"{tomorrow}T10:00:00",
+        patient_name="Alice Formatted",
+        reason="Follow-up consultation",
+        session_factory=session_tracker,
+    )
+    assert res_book["success"] is True, res_book
+    appt_id = res_book["appointment"]["id"]
+    assert res_book["appointment"]["patient_id"] == formatted_patient_id
+
+    with TestingSessionLocal() as db:
+        reloaded_alice = db.query(Patient).filter(Patient.id == formatted_patient_id).first()
+        assert reloaded_alice.phone == "+1-555-111-2222"
+    print(f"  ✓ Booked appointment #{appt_id} and preserved original stored phone format")
+
+    # 5. Cancellation by another patient's phone is rejected
+    print("\n[TEST 5] Reject Cancellation by Different Patient")
+    other_state = VoiceCallState()
+    other_state.confirm_phone("+1-555-999-8888")
+
+    res_wrong_owner = await cancel_appointment(
+        call_state=other_state,
+        appointment_id=appt_id,
+        session_factory=session_tracker,
+    )
+    assert res_wrong_owner["success"] is False
+    assert res_wrong_owner.get("status_code") == 403
+
+    with TestingSessionLocal() as db:
+        still_active = db.query(Appointment).filter(Appointment.id == appt_id).first()
+        assert still_active.status == "scheduled"
+    print("  ✓ Cancellation by different caller rejected with 403; appointment remains scheduled")
+
+    # 6. Cancellation by the correct patient succeeds (despite different phone formatting)
+    print("\n[TEST 6] Cancellation by Correct Patient")
+    res_cancel = await cancel_appointment(
+        call_state=alice_state,
+        appointment_id=appt_id,
+        session_factory=session_tracker,
+    )
+    assert res_cancel["success"] is True, res_cancel
+    assert res_cancel["appointment"]["status"] == "cancelled"
+    print(f"  ✓ Appointment #{appt_id} cancelled by confirmed owner")
+
+    # 8. Pipecat Tool Registration & Per-Call Closure Isolation
+    print("\n[TEST 8] Pipecat Tool Registration & Per-Call Closure Isolation")
+    llm_call_a = GroqLLMService(api_key="test-key-unused")
+    state_call_a = VoiceCallState()
+    tools_a = register_appointment_tools(
+        llm_call_a, state_call_a, session_factory=session_tracker
+    )
+
+    tool_names = [t.name for t in tools_a.standard_tools]
+    assert tool_names == [
+        "check_doctor_availability",
+        "book_appointment",
+        "cancel_appointment",
+    ]
+    for name in tool_names:
+        assert llm_call_a.has_function(name), f"Missing registered function: {name}"
+
+    schema_map = {t.name: t for t in tools_a.standard_tools}
+    assert set(schema_map["check_doctor_availability"].properties.keys()) == {
+        "date",
+        "doctor_id",
+        "specialty",
+    }
+    assert set(schema_map["book_appointment"].properties.keys()) == {
+        "doctor_id",
+        "appointment_datetime",
+        "patient_name",
+        "email",
+        "reason",
+    }
+    assert set(schema_map["cancel_appointment"].properties.keys()) == {"appointment_id"}
+    for schema in schema_map.values():
+        assert "phone_confirmed" not in schema.properties
+        assert "patient_phone" not in schema.properties
+
+    dummy_ctx = LLMContext(tools=tools_a)
+
+    async def invoke_registered(llm_svc, fn_name, arguments):
+        captured = []
+
+        async def _cb(result, *, properties=None):
+            captured.append(result)
+
+        handler = llm_svc._functions[fn_name].handler
+        params = FunctionCallParams(
+            function_name=fn_name,
+            tool_call_id="call-1",
+            arguments=arguments,
+            llm=llm_svc,
+            pipeline_worker=None,
+            context=dummy_ctx,
+            result_callback=_cb,
+        )
+        await handler(params)
+        assert len(captured) == 1
+        return captured[0]
+
+    # Availability via registered handler
+    reg_avail = await invoke_registered(
+        llm_call_a,
+        "check_doctor_availability",
+        {"date": tomorrow, "doctor_id": active_doctor_id},
+    )
+    assert reg_avail["success"] is True
+
+    # Invalid arg handling
+    reg_bad_arg = await invoke_registered(
+        llm_call_a,
+        "book_appointment",
+        {
+            "doctor_id": "not-an-int",
+            "appointment_datetime": f"{tomorrow}T11:00:00",
+            "patient_name": "Test User",
+        },
+    )
+    assert reg_bad_arg["success"] is False
+
+    # Cannot bypass phone confirmation with extra LLM argument
+    reg_bypass = await invoke_registered(
+        llm_call_a,
+        "book_appointment",
+        {
+            "doctor_id": active_doctor_id,
+            "appointment_datetime": f"{tomorrow}T11:00:00",
+            "patient_name": "Bypass Attempt",
+            "phone_confirmed": True,
+        },
+    )
+    assert reg_bypass["success"] is False
+    assert "confirmed" in reg_bypass["error"].lower()
+
+    # Second call with its own confirmed state does not leak to call A
+    llm_call_b = GroqLLMService(api_key="test-key-unused")
+    state_call_b = VoiceCallState()
+    state_call_b.confirm_phone("+1-555-777-8888")
+    register_appointment_tools(llm_call_b, state_call_b, session_factory=session_tracker)
+
+    reg_still_unconfirmed = await invoke_registered(
+        llm_call_a,
+        "book_appointment",
+        {
+            "doctor_id": active_doctor_id,
+            "appointment_datetime": f"{tomorrow}T11:00:00",
+            "patient_name": "Call A Unconfirmed",
+        },
+    )
+    assert reg_still_unconfirmed["success"] is False
+
+    reg_book_b = await invoke_registered(
+        llm_call_b,
+        "book_appointment",
+        {
+            "doctor_id": active_doctor_id,
+            "appointment_datetime": f"{tomorrow}T11:00:00",
+            "patient_name": "Call B Confirmed",
+            "email": "callb@example.com",
+            "reason": "Checkup",
+        },
+    )
+    assert reg_book_b["success"] is True, reg_book_b
+    appt_b_id = reg_book_b["appointment"]["id"]
+
+    assert schema_map["book_appointment"].properties["email"]["type"] == ["string", "null"]
+    assert schema_map["book_appointment"].properties["reason"]["type"] == ["string", "null"]
+    assert schema_map["check_doctor_availability"].properties["doctor_id"]["type"] == ["integer", "null"]
+    assert schema_map["check_doctor_availability"].properties["specialty"]["type"] == ["string", "null"]
+
+    reg_cancel_b = await invoke_registered(
+        llm_call_b,
+        "cancel_appointment",
+        {"appointment_id": appt_b_id},
+    )
+    assert reg_cancel_b["success"] is True, reg_cancel_b
+
+    # Booking with omitted email & reason succeeds
+    reg_book_omitted = await invoke_registered(
+        llm_call_b,
+        "book_appointment",
+        {
+            "doctor_id": active_doctor_id,
+            "appointment_datetime": f"{tomorrow}T11:30:00",
+            "patient_name": "Omitted Fields Patient",
+        },
+    )
+    assert reg_book_omitted["success"] is True, reg_book_omitted
+
+    # Booking with empty-string and null email & reason on a new patient converts to None and succeeds
+    llm_call_c = GroqLLMService(api_key="test-key-unused")
+    state_call_c = VoiceCallState()
+    state_call_c.confirm_phone("+1-555-777-9999")
+    register_appointment_tools(llm_call_c, state_call_c, session_factory=session_tracker)
+
+    reg_book_nulls = await invoke_registered(
+        llm_call_c,
+        "book_appointment",
+        {
+            "doctor_id": active_doctor_id,
+            "appointment_datetime": f"{tomorrow}T14:00:00",
+            "patient_name": "Null Fields Patient",
+            "email": "   ",
+            "reason": None,
+        },
+    )
+    assert reg_book_nulls["success"] is True, reg_book_nulls
+    with TestingSessionLocal() as db:
+        saved_null_appt = db.query(Appointment).filter(Appointment.id == reg_book_nulls["appointment"]["id"]).first()
+        assert saved_null_appt.reason is None
+        assert saved_null_appt.patient.email is None
+
+    # Invalid booking (outside clinic hours) is still rejected
+    reg_book_invalid = await invoke_registered(
+        llm_call_b,
+        "book_appointment",
+        {
+            "doctor_id": active_doctor_id,
+            "appointment_datetime": f"{tomorrow}T22:00:00",
+            "patient_name": "After Hours Patient",
+        },
+    )
+    assert reg_book_invalid["success"] is False
+    assert reg_book_invalid.get("status_code") == 400
+    print("  ✓ Registered schemas, closure isolation, optional null/empty fields, and safeguards verified")
+
+    # 9. Phone Confirmation State Machine Safeguards
+    print("\n[TEST 9] Phone Confirmation State Machine Safeguards")
+    seq_state = VoiceCallState()
+    tracker = PhoneConfirmationTracker(seq_state)
+
+    # ISO date must not be captured as a phone number
+    tracker.process_user_transcript(f"I want an appointment on {tomorrow}")
+    assert seq_state.pending_phone is None
+    assert seq_state.confirmed_phone is None
+
+    # Candidate phone captured -> still unconfirmed
+    tracker.process_user_transcript("My phone number is 555-234-5678")
+    assert seq_state.pending_phone == "5552345678"
+    assert seq_state.confirmed_phone is None
+    assert tracker.readback_completed is False
+
+    # Premature "yes" before assistant readback must NOT confirm
+    tracker.process_user_transcript("yes")
+    assert seq_state.confirmed_phone is None
+
+    # Assistant reads back the number
+    tracker.append_assistant_text("Let me confirm, is your number 555-234-5678?")
+    tracker.complete_assistant_turn()
+    assert tracker.readback_completed is True
+    assert seq_state.confirmed_phone is None
+
+    # Trick phrase containing "yes" AND "no"/"isn't" must REJECT and clear
+    tracker.process_user_transcript("no, yes isn't correct")
+    assert seq_state.pending_phone is None
+    assert seq_state.confirmed_phone is None
+
+    # Re-capture, read back, ambiguous phrase -> stays unconfirmed, then explicit confirm
+    tracker.process_user_transcript("Actually it is +1 (555) 234-5679")
+    tracker.append_assistant_text("Got it, +1 555-234-5679. Is that right?")
+    tracker.complete_assistant_turn()
+    tracker.process_user_transcript("uh maybe let me check")
+    assert seq_state.confirmed_phone is None
+    tracker.process_user_transcript("Yes, that's correct!")
+    assert seq_state.confirmed_phone == "+15552345679"
+    print("  ✓ Phone confirmation enforces capture -> readback -> strict confirmation")
+
+    # 10. Missing Voice Config, Pipeline Creation, Per-Call Isolation & Cleanup
+    print("\n[TEST 10] Voice Config, Pipeline Creation, Isolation & Cleanup")
+    missing_cfg = Settings(
+        _env_file=None,
+        GROQ_API_KEY=None,
+        ELEVENLABS_API_KEY=None,
+        ELEVENLABS_VOICE_ID=None,
+    )
+    try:
+        validate_voice_config(missing_cfg)
+        raise AssertionError("Expected VoiceConfigurationError for missing config")
+    except VoiceConfigurationError as exc:
+        assert "GROQ_API_KEY" in str(exc)
+        assert "ELEVENLABS_API_KEY" in str(exc)
+        assert "ELEVENLABS_VOICE_ID" in str(exc)
+
+    dummy_cfg = Settings(
+        _env_file=None,
+        GROQ_API_KEY="dummy-groq-key",
+        ELEVENLABS_API_KEY="dummy-el-key",
+        ELEVENLABS_VOICE_ID="dummy-voice-id",
+    )
+    conn_1 = SmallWebRTCConnection()
+    conn_2 = SmallWebRTCConnection()
+    task_1, transport_1, state_1, _ = build_voice_pipeline(conn_1, dummy_cfg)
+    task_2, transport_2, state_2, _ = build_voice_pipeline(conn_2, dummy_cfg)
+
+    assert state_1 is not state_2
+    assert task_1 is not task_2
+    assert transport_1 is not transport_2
+    state_1.confirm_phone("+15550001111")
+    assert state_2.confirmed_phone is None
+
+    await task_1.cancel()
+    await task_2.cancel()
+
+    # Verify FastAPI lifespan creates & closes shared aiohttp session and /voice/offer rejects when unconfigured
+    from app.api.v1.endpoints import voice as voice_endpoint
+
+    orig_validate = voice_endpoint.validate_voice_config
+
+    def _raise_missing():
+        raise VoiceConfigurationError("Missing voice config")
+
+    voice_endpoint.validate_voice_config = _raise_missing
+    try:
+        with TestClient(fastapi_app) as client:
+            assert hasattr(fastapi_app.state, "aiohttp_session")
+            assert fastapi_app.state.aiohttp_session.closed is False
+            res_offer = client.post(
+                "/api/v1/voice/offer",
+                json={"sdp": "v=0", "type": "offer"},
+            )
+            assert res_offer.status_code == 503
+        assert fastapi_app.state.aiohttp_session.closed is True
+    finally:
+        voice_endpoint.validate_voice_config = orig_validate
+    print("  ✓ Missing config returns 503, pipelines are isolated, and resources close cleanly")
+
+    # 11. Verify all DB sessions created were closed
+    print("\n[TEST 11] Database Session Cleanup")
+    assert session_tracker.created_count > 0
+    assert session_tracker.created_count == session_tracker.closed_count, (
+        f"Session leak: created={session_tracker.created_count}, closed={session_tracker.closed_count}"
+    )
+    print(f"  ✓ All {session_tracker.created_count} SQLAlchemy sessions were properly closed")
+
+    if dev_db_initial_stat is not None:
+        dev_db_final_stat = (os.path.getmtime(dev_db_path), os.path.getsize(dev_db_path))
+        assert dev_db_initial_stat == dev_db_final_stat
+        print("  ✓ Development database (appointments.db) was NOT modified")
+
+    print("\n" + "=" * 70)
+    print("ALL VOICE TOOL & PIPELINE TESTS PASSED SUCCESSFULLY! (10/10 TEST SUITES VERIFIED)")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    asyncio.run(run_voice_tool_tests())

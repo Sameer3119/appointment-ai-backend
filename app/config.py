@@ -1,4 +1,4 @@
-from typing import List, Union
+from typing import List, Optional, Union
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -26,6 +26,16 @@ class Settings(BaseSettings):
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ]
+
+    # Voice AI Service Configuration (optional so REST APIs start without voice credentials)
+    GOOGLE_API_KEY: Optional[str] = None
+    GEMINI_MODEL: str = "gemini-3.6-flash"
+    GROQ_API_KEY: Optional[str] = None
+    GROQ_MODEL: str = "openai/gpt-oss-120b"
+    ELEVENLABS_API_KEY: Optional[str] = None
+    ELEVENLABS_VOICE_ID: Optional[str] = None
+    ELEVENLABS_STT_MODEL: str = "scribe_v2_realtime"
+    ELEVENLABS_TTS_MODEL: str = "eleven_flash_v2_5"
 
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod

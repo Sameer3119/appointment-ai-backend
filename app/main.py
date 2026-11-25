@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import aiohttp
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
@@ -7,6 +8,7 @@ from app.database import engine, Base, SessionLocal
 # Import all SQLAlchemy models so that Base.metadata has knowledge of all tables before create_all is invoked
 import app.models  # noqa: F401
 from app.api.v1.endpoints import health
+from app.api.v1.endpoints.voice import close_voice_resources
 from app.api.v1.router import api_router
 from app.seed import seed_doctors
 
@@ -19,7 +21,8 @@ async def lifespan(app: FastAPI):
     Handles application startup and shutdown events:
     - Startup: Automatically creates SQLite database tables for Doctor, Patient, Appointment if they do not exist.
                Safely seeds initial sample doctors if the database is newly initialized.
-    - Shutdown: Cleans up resources if necessary.
+               Creates a shared aiohttp.ClientSession for outbound HTTP services.
+    - Shutdown: Cancels active voice pipelines, closes WebRTC handler, and closes shared aiohttp session.
     """
     # Create all database tables on application startup
     Base.metadata.create_all(bind=engine)
@@ -28,8 +31,13 @@ async def lifespan(app: FastAPI):
     with SessionLocal() as db:
         seed_doctors(db)
 
-    yield
-    # Code after yield runs on shutdown (e.g. closing connection pools if needed)
+    app.state.aiohttp_session = aiohttp.ClientSession()
+
+    try:
+        yield
+    finally:
+        await close_voice_resources()
+        await app.state.aiohttp_session.close()
 
 
 # Initialize FastAPI application
