@@ -34,6 +34,7 @@ from app.voice.phone_confirmation import (
     PhoneConfirmationTracker,
     UserPhoneCaptureProcessor,
 )
+from app.voice.speech_timing import attach_speech_timing_logs
 from app.voice.tools import register_appointment_tools
 
 MEDIVOICE_SYSTEM_INSTRUCTION = (
@@ -113,6 +114,7 @@ def build_voice_pipeline(
     )
 
     tools = register_appointment_tools(llm, call_state)
+    attach_speech_timing_logs(llm, tts, transport)
 
     context = LLMContext(
         messages=[{"role": "system", "content": MEDIVOICE_SYSTEM_INSTRUCTION}],

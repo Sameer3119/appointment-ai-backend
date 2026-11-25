@@ -509,6 +509,29 @@ async def run_voice_tool_tests():
     assert tts_services[0]._auto_mode is True
     assert transport_1._params.audio_out_10ms_chunks == 2
 
+    # Verify privacy-safe speech timing hooks are attached without leaking text or secrets
+    from pipecat.frames.frames import LLMTextFrame, OutputAudioRawFrame
+    from app.voice.speech_timing import attach_speech_timing_logs
+
+    timing_logs = []
+    from loguru import logger as loguru_logger
+    sink_id = loguru_logger.add(lambda m: timing_logs.append(str(m)), level="DEBUG")
+    try:
+        stats = attach_speech_timing_logs(groq_services[0], tts_services[0], transport_1)
+        await groq_services[0]._push_llm_text("SecretPatientName 555-123-4567")
+        await transport_1.output().write_audio_frame(
+            OutputAudioRawFrame(audio=b"\x00" * 960, sample_rate=24000, num_channels=1)
+        )
+        assert stats.llm_chunks == 1
+        assert stats.transport_out_frames == 1
+        joined_logs = "\n".join(timing_logs)
+        assert "SecretPatientName" not in joined_logs
+        assert "555-123-4567" not in joined_logs
+        assert "dummy-groq-key" not in joined_logs
+        assert "dummy-el-key" not in joined_logs
+    finally:
+        loguru_logger.remove(sink_id)
+
     await task_1.cancel()
     await task_2.cancel()
 
