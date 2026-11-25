@@ -498,6 +498,17 @@ async def run_voice_tool_tests():
     assert not any(isinstance(s, TurnAnalyzerUserTurnStopStrategy) for s in strategies.stop)
     assert strategies.stop[0]._user_speech_timeout == 0.8
 
+    # Verify low-latency Groq, ElevenLabs TTS, and transport chunking settings
+    from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+
+    groq_services = [p for p in _iter_processors(task_1.pipeline) if isinstance(p, GroqLLMService)]
+    tts_services = [p for p in _iter_processors(task_1.pipeline) if isinstance(p, ElevenLabsTTSService)]
+    assert len(groq_services) == 1
+    assert groq_services[0]._settings.reasoning_effort == "low"
+    assert len(tts_services) == 1
+    assert tts_services[0]._auto_mode is True
+    assert transport_1._params.audio_out_10ms_chunks == 2
+
     await task_1.cancel()
     await task_2.cancel()
 

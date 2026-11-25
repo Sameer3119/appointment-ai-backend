@@ -82,6 +82,7 @@ def build_voice_pipeline(
         params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
+            audio_out_10ms_chunks=2,
         ),
     )
 
@@ -97,11 +98,14 @@ def build_voice_pipeline(
         settings=GroqLLMService.Settings(
             model=cfg.GROQ_MODEL,
             system_instruction=MEDIVOICE_SYSTEM_INSTRUCTION,
+            reasoning_effort="low",
         ),
     )
 
     tts = ElevenLabsTTSService(
         api_key=cfg.ELEVENLABS_API_KEY,
+        sample_rate=24000,
+        auto_mode=True,
         settings=ElevenLabsTTSService.Settings(
             voice=cfg.ELEVENLABS_VOICE_ID,
             model=cfg.ELEVENLABS_TTS_MODEL,
