@@ -15,9 +15,18 @@ from aiortc.rtcicetransport import connection_kwargs
 from fastapi.testclient import TestClient
 import httpx
 from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator
 from pipecat.services.groq.llm import GroqLLMService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+from pipecat.turns.user_start import (
+    TranscriptionUserTurnStartStrategy,
+    VADUserTurnStartStrategy,
+)
+from pipecat.turns.user_stop import (
+    SpeechTimeoutUserTurnStopStrategy,
+    TurnAnalyzerUserTurnStopStrategy,
+)
 
 from app.config import Settings
 from app.database import Base
@@ -466,6 +475,28 @@ async def run_voice_tool_tests():
     assert transport_1 is not transport_2
     state_1.confirm_phone("+15550001111")
     assert state_2.confirmed_phone is None
+
+    # Verify explicit user-turn stop strategy and VAD stop_secs on user_aggregator
+    def _iter_processors(root):
+        for proc in getattr(root, "processors", []):
+            yield proc
+            yield from _iter_processors(proc)
+
+    user_aggregators = [
+        proc for proc in _iter_processors(task_1.pipeline) if isinstance(proc, LLMUserAggregator)
+    ]
+    assert len(user_aggregators) == 1
+    user_agg = user_aggregators[0]
+    assert user_agg._params.vad_analyzer.params.stop_secs == 0.3
+    assert user_agg._params.user_mute_strategies == []
+    strategies = user_agg._user_turn_controller.user_turn_strategies
+    assert [type(s) for s in strategies.start] == [
+        VADUserTurnStartStrategy,
+        TranscriptionUserTurnStartStrategy,
+    ]
+    assert [type(s) for s in strategies.stop] == [SpeechTimeoutUserTurnStopStrategy]
+    assert not any(isinstance(s, TurnAnalyzerUserTurnStopStrategy) for s in strategies.stop)
+    assert strategies.stop[0]._user_speech_timeout == 0.8
 
     await task_1.cancel()
     await task_2.cancel()

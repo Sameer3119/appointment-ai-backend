@@ -20,6 +20,12 @@ from pipecat.services.groq.llm import GroqLLMService
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+from pipecat.turns.user_start import (
+    TranscriptionUserTurnStartStrategy,
+    VADUserTurnStartStrategy,
+)
+from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 from app.config import Settings, settings
 from app.services.voice_tool_service import VoiceCallState
@@ -111,7 +117,16 @@ def build_voice_pipeline(
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.3)),
+            user_turn_strategies=UserTurnStrategies(
+                start=[
+                    VADUserTurnStartStrategy(),
+                    TranscriptionUserTurnStartStrategy(),
+                ],
+                stop=[
+                    SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.8),
+                ],
+            ),
         ),
     )
 
