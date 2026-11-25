@@ -11,7 +11,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from aiortc.rtcicetransport import connection_kwargs
 from fastapi.testclient import TestClient
+import httpx
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.groq.llm import GroqLLMService
 from pipecat.services.llm_service import FunctionCallParams
@@ -30,6 +32,12 @@ from app.services.voice_tool_service import (
     cancel_appointment,
     check_doctor_availability,
     normalize_phone,
+)
+from app.voice.ice import (
+    MeteredTurnError,
+    fetch_ice_servers,
+    prioritize_ice_servers,
+    to_rtc_ice_servers,
 )
 from app.voice.phone_confirmation import PhoneConfirmationTracker
 from app.voice.pipeline import (
@@ -480,10 +488,78 @@ async def run_voice_tool_tests():
                 json={"sdp": "v=0", "type": "offer"},
             )
             assert res_offer.status_code == 503
+            res_ice = client.get("/api/v1/voice/ice-config")
+            assert res_ice.status_code == 200
+            assert "iceServers" in res_ice.json()
         assert fastapi_app.state.aiohttp_session.closed is True
     finally:
         voice_endpoint.validate_voice_config = orig_validate
     print("  ✓ Missing config returns 503, pipelines are isolated, and resources close cleanly")
+
+    # 11. Metered.ca TURN Prioritization & Fallback
+    print("\n[TEST 11] Metered.ca TURN Prioritization & Fallback")
+    sample_metered = [
+        {"urls": "stun:stun.relay.metered.ca:80"},
+        {"urls": "turn:global.relay.metered.ca:80", "username": "u1", "credential": "p1"},
+        {"urls": "turn:global.relay.metered.ca:80?transport=tcp", "username": "u1", "credential": "p1"},
+        {"urls": "turn:global.relay.metered.ca:443", "username": "u1", "credential": "p1"},
+        {"urls": "turns:global.relay.metered.ca:443?transport=tcp", "username": "u1", "credential": "p1"},
+    ]
+    ordered = prioritize_ice_servers(sample_metered)
+    turn_entries = [s for s in ordered if str(s["urls"]).startswith("turn")]
+    assert turn_entries[0]["urls"] == "turns:global.relay.metered.ca:443?transport=tcp"
+
+    aiortc_kwargs = connection_kwargs(to_rtc_ice_servers(ordered))
+    assert aiortc_kwargs["turn_server"] == ("global.relay.metered.ca", 443)
+    assert aiortc_kwargs["turn_ssl"] is True
+    assert aiortc_kwargs["turn_transport"] == "tcp"
+
+    # Mocked Metered HTTP fetch
+    def _mock_metered_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "doctor_appointment_ai.metered.live"
+        assert request.url.path == "/api/v1/turn/credentials"
+        assert request.url.params.get("apiKey") == "mock-metered-key"
+        return httpx.Response(200, json=sample_metered)
+
+    metered_cfg = Settings(
+        _env_file=None,
+        METERED_DOMAIN="doctor_appointment_ai.metered.live",
+        METERED_API_KEY="mock-metered-key",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_mock_metered_handler)) as mock_client:
+        fetched = await fetch_ice_servers(metered_cfg, http_client=mock_client)
+    assert [s for s in fetched if str(s["urls"]).startswith("turn")][0]["urls"] == (
+        "turns:global.relay.metered.ca:443?transport=tcp"
+    )
+
+    # Configured Metered failure raises MeteredTurnError instead of silent STUN fallback
+    def _mock_metered_fail(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "upstream failure"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_mock_metered_fail)) as fail_client:
+        try:
+            await fetch_ice_servers(metered_cfg, http_client=fail_client)
+            raise AssertionError("Expected MeteredTurnError on configured Metered failure")
+        except MeteredTurnError as exc:
+            assert "mock-metered-key" not in str(exc)
+
+    # Endpoint returns 503 when MeteredTurnError occurs
+    async def _raise_metered_err():
+        raise MeteredTurnError("Unable to retrieve TURN relay credentials.")
+
+    orig_fetch_ice = voice_endpoint.fetch_ice_servers
+    voice_endpoint.fetch_ice_servers = _raise_metered_err
+    try:
+        with TestClient(fastapi_app) as client:
+            res_503 = client.get("/api/v1/voice/ice-config")
+            assert res_503.status_code == 503
+    finally:
+        voice_endpoint.fetch_ice_servers = orig_fetch_ice
+
+    # Unconfigured fallback to Google STUN
+    fallback = await fetch_ice_servers(Settings(_env_file=None, METERED_DOMAIN=None, METERED_API_KEY=None))
+    assert fallback == [{"urls": "stun:stun.l.google.com:19302"}]
+    print("  ✓ Metered turns:443?transport=tcp prioritized, 503 on failure, and STUN fallback verified")
 
     # 11. Verify all DB sessions created were closed
     print("\n[TEST 11] Database Session Cleanup")

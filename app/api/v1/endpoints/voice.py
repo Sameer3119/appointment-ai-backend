@@ -13,6 +13,7 @@ from pipecat.transports.smallwebrtc.request_handler import (
     SmallWebRTCRequestHandler,
 )
 
+from app.voice.ice import MeteredTurnError, fetch_ice_servers, to_rtc_ice_servers
 from app.voice.pipeline import (
     VoiceConfigurationError,
     run_voice_pipeline,
@@ -27,6 +28,19 @@ webrtc_handler = SmallWebRTCRequestHandler(
 _active_voice_tasks: Set[asyncio.Task] = set()
 
 
+@router.get("/ice-config", summary="Get WebRTC ICE/TURN server configuration")
+async def get_ice_config():
+    """Return short-lived ICE/TURN server configuration without exposing API keys."""
+    try:
+        ice_servers = await fetch_ice_servers()
+    except MeteredTurnError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    return {"iceServers": ice_servers}
+
+
 @router.post("/offer", summary="WebRTC SDP offer for voice session")
 async def voice_offer(request: SmallWebRTCRequest):
     """Handle an incoming SmallWebRTC SDP offer and start an isolated voice pipeline."""
@@ -37,6 +51,15 @@ async def voice_offer(request: SmallWebRTCRequest):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
         ) from exc
+
+    try:
+        ice_servers = await fetch_ice_servers()
+    except MeteredTurnError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    webrtc_handler._ice_servers = to_rtc_ice_servers(ice_servers)
 
     async def on_webrtc_connection(webrtc_connection: SmallWebRTCConnection) -> None:
         task = asyncio.create_task(run_voice_pipeline(webrtc_connection))

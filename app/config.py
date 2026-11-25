@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     ELEVENLABS_STT_MODEL: str = "scribe_v2_realtime"
     ELEVENLABS_TTS_MODEL: str = "eleven_flash_v2_5"
 
+    # Metered.ca TURN Server (optional; required for WebRTC NAT traversal on Render)
+    METERED_DOMAIN: Optional[str] = None
+    METERED_API_KEY: Optional[str] = None
+
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def parse_cors_origins(cls, value: Union[str, List[str]]) -> List[str]:
