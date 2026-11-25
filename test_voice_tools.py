@@ -523,6 +523,10 @@ async def run_voice_tool_tests():
     assert groq_services[0]._settings.reasoning_effort == "low"
     assert len(tts_services) == 1
     assert tts_services[0]._auto_mode is True
+    assert tts_services[0]._stop_frame_timeout_s == 12.0, (
+        f"Expected stop_frame_timeout_s=12.0 to prevent premature no-audio declaration "
+        f"on slow ElevenLabs responses; got {tts_services[0]._stop_frame_timeout_s}"
+    )
     assert transport_1._params.audio_out_10ms_chunks == 2
 
     # Verify privacy-safe speech timing hooks are attached without leaking text or secrets
@@ -550,6 +554,80 @@ async def run_voice_tool_tests():
 
     await task_1.cancel()
     await task_2.cancel()
+
+    # 12. TTS no-audio context diagnostics in speech_timing.py
+    print("\n[TEST 12] TTS Context No-Audio Diagnostics (per-context tracking)")
+    from pipecat.frames.frames import TTSAudioRawFrame, TTSStoppedFrame
+    from app.voice.speech_timing import _ContextAudioStats
+
+    # Build a fresh pair of services with a new pipeline so attach is clean.
+    conn_tst = SmallWebRTCConnection()
+    task_tst, transport_tst, _, _ = build_voice_pipeline(conn_tst, dummy_cfg)
+    tst_processors = list(_iter_processors(task_tst.pipeline))
+    groq_tst = next(p for p in tst_processors if isinstance(p, GroqLLMService))
+    from pipecat.services.elevenlabs.tts import ElevenLabsTTSService as _ElevenLabsTTSService
+    tts_tst = next(p for p in tst_processors if isinstance(p, _ElevenLabsTTSService))
+
+    # Verify stop_frame_timeout_s extended to 12.0 on newly built TTS.
+    assert tts_tst._stop_frame_timeout_s == 12.0, (
+        f"stop_frame_timeout_s must be 12.0; got {tts_tst._stop_frame_timeout_s}"
+    )
+
+    # Collect log messages for assertion.
+    t12_logs: list[str] = []
+    sink12 = loguru_logger.add(lambda m: t12_logs.append(str(m)), level="DEBUG")
+    try:
+        stats12 = attach_speech_timing_logs(groq_tst, tts_tst, transport_tst)
+
+        # Sub-test A: Normal path — audio chunk followed by TTSStoppedFrame.
+        ctx_a = "aaaaaaaa-1111-2222-3333-444444444444"
+        await tts_tst._send_text("Hello", ctx_a)
+        audio_frame_a = TTSAudioRawFrame(
+            audio=b"\x00" * 480, sample_rate=24000, num_channels=1, context_id=ctx_a
+        )
+        await tts_tst.append_to_audio_context(ctx_a, audio_frame_a)
+        stopped_frame_a = TTSStoppedFrame(context_id=ctx_a)
+        await tts_tst.append_to_audio_context(ctx_a, stopped_frame_a)
+        joined_a = "\n".join(t12_logs)
+        assert "no-audio outcome" not in joined_a, (
+            "Normal audio+stop context should not trigger no-audio warning"
+        )
+        assert stats12.tts_audio_chunks == 1
+
+        # Sub-test B: No-audio path — only TTSStoppedFrame, no audio chunks.
+        t12_logs.clear()
+        ctx_b = "bbbbbbbb-1111-2222-3333-444444444444"
+        await tts_tst._send_text("Test", ctx_b)
+        stopped_frame_b = TTSStoppedFrame(context_id=ctx_b)
+        await tts_tst.append_to_audio_context(ctx_b, stopped_frame_b)
+        joined_b = "\n".join(t12_logs)
+        assert "no-audio outcome" in joined_b, (
+            "Should warn when context completes with zero audio chunks"
+        )
+        assert ctx_b[:8] in joined_b, "Warning should include the context ID prefix"
+
+        # Sub-test C: Text and secret redaction — no-audio warning must not log patient text.
+        t12_logs.clear()
+        ctx_c = "cccccccc-1111-2222-3333-444444444444"
+        await tts_tst._send_text("PatientSecretText 555-000-9999", ctx_c)
+        stopped_frame_c = TTSStoppedFrame(context_id=ctx_c)
+        await tts_tst.append_to_audio_context(ctx_c, stopped_frame_c)
+        joined_c = "\n".join(t12_logs)
+        assert "PatientSecretText" not in joined_c
+        assert "555-000-9999" not in joined_c
+        assert "dummy-el-key" not in joined_c
+
+        # Sub-test D: _ContextAudioStats dataclass defaults.
+        cs = _ContextAudioStats()
+        assert cs.audio_chunks == 0
+        assert cs.first_text_t == 0.0
+        assert cs.close_t == 0.0
+
+    finally:
+        loguru_logger.remove(sink12)
+
+    await task_tst.cancel()
+    print("  ✓ Per-context audio tracking: normal+no-audio paths, redaction, timeout extension verified")
 
     # Verify FastAPI lifespan creates & closes shared aiohttp session and /voice/offer rejects when unconfigured
     from app.api.v1.endpoints import voice as voice_endpoint

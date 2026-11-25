@@ -7,6 +7,7 @@ logging patient data, transcript text, or API credentials:
 3. Consecutive ElevenLabs audio chunks arriving from WebSocket.
 4. Consecutive audio frames leaving SmallWebRTCTransport output.
 5. TTS text-send buffering, flush_audio, and context-finalization delays.
+6. Per-context audio chunk counts and no-audio outcome detection.
 """
 
 import time
@@ -35,6 +36,15 @@ TRANSPORT_OUT_GAP_WARN_MS = 150.0
 def _short_ctx(context_id: str | None) -> str:
     """Safely format a nullable context ID for log correlation."""
     return (str(context_id) if context_id is not None else "none")[:8]
+
+
+@dataclass
+class _ContextAudioStats:
+    """Per-context audio tracking for no-audio outcome diagnostics."""
+
+    audio_chunks: int = 0
+    first_text_t: float = 0.0
+    close_t: float = 0.0  # time when close_context was called; 0 = not yet called
 
 
 @dataclass
@@ -70,6 +80,12 @@ def attach_speech_timing_logs(
         "last_tts_audio_t": None,
         "last_transport_out_t": None,
     }
+
+    # Per-context audio-chunk tracking: context_id -> _ContextAudioStats.
+    # Bounded: entries are removed on TTSStoppedFrame (normal) or when a new
+    # context_id is seen after close_context (timeout-dropped context).
+    # Worst case holds one entry per concurrent TTS context; this is typically one.
+    _ctx_stats: dict[str, _ContextAudioStats] = {}
 
     # 1. Consecutive Groq text chunks
     orig_push_llm_text = llm._push_llm_text
@@ -149,6 +165,12 @@ def attach_speech_timing_logs(
     async def tracked_send_text(text: str, context_id: str):
         try:
             now = time.perf_counter()
+            # Register this context for audio-chunk tracking on first send.
+            ctx_key = str(context_id) if context_id is not None else ""
+            if ctx_key and ctx_key not in _ctx_stats:
+                _ctx_stats[ctx_key] = _ContextAudioStats(
+                    first_text_t=now if state["first_tts_in_t"] is None else state["first_tts_in_t"],
+                )
             since_first_in = (
                 (now - state["first_tts_in_t"]) * 1000.0
                 if state["first_tts_in_t"] is not None
@@ -187,6 +209,10 @@ def attach_speech_timing_logs(
         res = await orig_close_context(context_id)
         try:
             stats.last_close_context_ms = (time.perf_counter() - t_start) * 1000.0
+            # Record close time for no-audio gap measurement when isFinal arrives late.
+            ctx_key = str(context_id) if context_id is not None else ""
+            if ctx_key and ctx_key in _ctx_stats:
+                _ctx_stats[ctx_key].close_t = time.perf_counter()
             logger.debug(
                 f"[SpeechTiming] ElevenLabs close_context ctx={_short_ctx(context_id)} "
                 f"took={stats.last_close_context_ms:.1f}ms"
@@ -198,8 +224,12 @@ def attach_speech_timing_logs(
     async def tracked_append_audio(context_id: str | None, frame: Frame):
         try:
             now = time.perf_counter()
+            ctx_key = str(context_id) if context_id is not None else ""
             if isinstance(frame, TTSAudioRawFrame):
                 stats.tts_audio_chunks += 1
+                # Accumulate per-context chunk count.
+                if ctx_key and ctx_key in _ctx_stats:
+                    _ctx_stats[ctx_key].audio_chunks += 1
                 last_t = state["last_tts_audio_t"]
                 if last_t is not None:
                     dt_ms = (now - last_t) * 1000.0
@@ -213,6 +243,29 @@ def attach_speech_timing_logs(
                         )
                 state["last_tts_audio_t"] = now
             elif isinstance(frame, TTSStoppedFrame):
+                # Emit no-audio diagnostic before the normal stop summary.
+                if ctx_key and ctx_key in _ctx_stats:
+                    cs = _ctx_stats.pop(ctx_key)
+                    if cs.audio_chunks == 0:
+                        # Context completed with no audio — diagnose why.
+                        close_to_final_ms = (
+                            (now - cs.close_t) * 1000.0 if cs.close_t > 0.0 else 0.0
+                        )
+                        logger.warning(
+                            f"[SpeechTiming] TTS context no-audio outcome "
+                            f"ctx={_short_ctx(context_id)} "
+                            f"close_to_stopped={close_to_final_ms:.1f}ms "
+                            f"(quota_exceeded or ElevenLabs returned isFinal with no audio)"
+                        )
+                    else:
+                        ttfa_ms = (
+                            (now - cs.first_text_t) * 1000.0 if cs.first_text_t > 0.0 else 0.0
+                        )
+                        logger.debug(
+                            f"[SpeechTiming] TTS context complete "
+                            f"ctx={_short_ctx(context_id)} "
+                            f"audio_chunks={cs.audio_chunks} ttfa={ttfa_ms:.1f}ms"
+                        )
                 logger.info(
                     f"[SpeechTiming] ElevenLabs context stopped ctx={_short_ctx(context_id)} "
                     f"max_audio_gap={stats.max_tts_audio_gap_ms:.1f}ms "

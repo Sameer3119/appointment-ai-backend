@@ -109,6 +109,11 @@ def build_voice_pipeline(
         api_key=cfg.ELEVENLABS_API_KEY,
         sample_rate=24000,
         auto_mode=True,
+        # ElevenLabs' observed TTFB can exceed 9 s on Render; the default 3 s
+        # context timeout fires first and declares the context audio-less before
+        # ElevenLabs returns its final message.  12 s gives enough headroom for
+        # slow responses while still bounding stuck contexts.
+        stop_frame_timeout_s=12.0,
         settings=ElevenLabsTTSService.Settings(
             voice=cfg.ELEVENLABS_VOICE_ID,
             model=cfg.ELEVENLABS_TTS_MODEL,
