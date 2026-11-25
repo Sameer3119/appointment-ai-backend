@@ -91,6 +91,8 @@ def build_voice_pipeline(
         api_key=cfg.ELEVENLABS_API_KEY,
         settings=ElevenLabsRealtimeSTTService.Settings(
             model=cfg.ELEVENLABS_STT_MODEL,
+            filter_background_audio=True,
+            no_verbatim=True,
         ),
     )
 
@@ -123,11 +125,18 @@ def build_voice_pipeline(
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.3)),
+            vad_analyzer=SileroVADAnalyzer(
+                params=VADParams(
+                    confidence=0.8,
+                    start_secs=0.3,
+                    stop_secs=0.3,
+                    min_volume=0.65,
+                )
+            ),
             user_turn_strategies=UserTurnStrategies(
                 start=[
                     VADUserTurnStartStrategy(),
-                    TranscriptionUserTurnStartStrategy(),
+                    TranscriptionUserTurnStartStrategy(use_interim=False),
                 ],
                 stop=[
                     SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.8),

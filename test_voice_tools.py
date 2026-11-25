@@ -487,16 +487,32 @@ async def run_voice_tool_tests():
     ]
     assert len(user_aggregators) == 1
     user_agg = user_aggregators[0]
-    assert user_agg._params.vad_analyzer.params.stop_secs == 0.3
+    vad_params = user_agg._params.vad_analyzer.params
+    assert vad_params.confidence == 0.8
+    assert vad_params.start_secs == 0.3
+    assert vad_params.stop_secs == 0.3
+    assert vad_params.min_volume == 0.65
     assert user_agg._params.user_mute_strategies == []
     strategies = user_agg._user_turn_controller.user_turn_strategies
     assert [type(s) for s in strategies.start] == [
         VADUserTurnStartStrategy,
         TranscriptionUserTurnStartStrategy,
     ]
+    assert strategies.start[1]._use_interim is False
     assert [type(s) for s in strategies.stop] == [SpeechTimeoutUserTurnStopStrategy]
     assert not any(isinstance(s, TurnAnalyzerUserTurnStopStrategy) for s in strategies.stop)
     assert strategies.stop[0]._user_speech_timeout == 0.8
+
+    # Verify ElevenLabs STT background noise filtering settings
+    from pipecat.services.elevenlabs.stt import CommitStrategy, ElevenLabsRealtimeSTTService
+
+    stt_services = [
+        p for p in _iter_processors(task_1.pipeline) if isinstance(p, ElevenLabsRealtimeSTTService)
+    ]
+    assert len(stt_services) == 1
+    assert stt_services[0]._commit_strategy == CommitStrategy.MANUAL
+    assert stt_services[0]._settings.filter_background_audio is True
+    assert stt_services[0]._settings.no_verbatim is True
 
     # Verify low-latency Groq, ElevenLabs TTS, and transport chunking settings
     from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
